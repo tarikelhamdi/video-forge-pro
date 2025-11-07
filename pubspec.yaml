@@ -1,0 +1,51 @@
+name: video_editor_pro
+description: Advanced desktop video editing application with Flutter UI and C++ processing core
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  
+  # FFI for C++ integration
+  ffi: ^2.1.0
+  
+  # Database
+  sqflite_common_ffi: ^2.3.0
+  path_provider: ^2.1.1
+  path: ^1.8.3
+  
+  # File management
+  file_picker: ^6.1.1
+  
+  # Video player
+  video_player: ^2.8.1
+  
+  # Drag and Drop
+  desktop_drop: ^0.4.4
+  cross_file: ^0.3.3+6
+  
+  # State management
+  flutter_riverpod: ^2.4.9
+  
+  # UI components
+  google_fonts: ^6.1.0
+  flutter_animate: ^4.3.0
+  
+  # Utilities
+  uuid: ^4.2.2
+  intl: ^0.18.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+  
+  # assets:
+  #   - assets/icons/
+  #   - assets/images/
