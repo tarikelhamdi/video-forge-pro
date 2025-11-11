@@ -42,13 +42,19 @@ class VideoProcessingService {
     _activeProcesses.clear();
   }
   
-  /// Run FFmpeg with resource management
+  /// Run FFmpeg with resource management and performance optimizations
   Future<ProcessResult> _runFFmpeg(List<String> arguments) async {
     if (_isCancelled) {
       throw Exception('Processing cancelled');
     }
     
-    final process = await Process.start('ffmpeg', arguments);
+    // إضافة Multi-threading optimization
+    final optimizedArgs = [
+      '-threads', '0', // استخدام كل النوى المتاحة
+      ...arguments,
+    ];
+    
+    final process = await Process.start('ffmpeg', optimizedArgs);
     _activeProcesses.add(process);
     
     final stdout = <int>[];
@@ -197,16 +203,18 @@ class VideoProcessingService {
       '-i', outroPath,
       '-vf', 'scale=$width:$height,fps=$fps',
       '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '23',
+      '-preset', 'veryfast', // تسريع (كان fast)
+      '-crf', '26', // جودة جيدة (كان 23)
+      '-pix_fmt', 'yuv420p',
       '-an', // No audio
+      '-movflags', '+faststart',
       '-y',
       normalizedOutro
     ]);
     
     if (normalizeResult.exitCode != 0) {
-      print('Warning: Failed to normalize outro, using original');
-      // Try without normalization
+      print('Warning: Failed to normalize outro, using re-encode method');
+      // Try without normalization but with re-encode
       final concatFile = path.join(tempDir.path, 'concat_list.txt');
       final concatContent = "file '${videoPath.replaceAll('\\', '/')}'\nfile '${outroPath.replaceAll('\\', '/')}'";
       File(concatFile).writeAsStringSync(concatContent);
@@ -215,7 +223,12 @@ class VideoProcessingService {
         '-f', 'concat',
         '-safe', '0',
         '-i', concatFile,
-        '-c', 'copy',
+        '-c:v', 'libx264',
+        '-preset', 'veryfast', // تسريع (كان fast)
+        '-crf', '26', // جودة جيدة (كان 23)
+        '-pix_fmt', 'yuv420p',
+        '-an',
+        '-movflags', '+faststart',
         '-y',
         outputPath
       ]);
@@ -239,15 +252,17 @@ class VideoProcessingService {
     print('Concat file created: $concatFile');
     print('Content:\n$concatContent');
     
-    // Step 3: Concatenate using concat demuxer
+    // Step 3: Concatenate using concat demuxer - محسّن للسرعة
     final result = await _runFFmpeg([
       '-f', 'concat',
       '-safe', '0',
       '-i', concatFile,
       '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '23',
+      '-preset', 'veryfast', // تسريع (كان fast)
+      '-crf', '26', // جودة جيدة (كان 23)
+      '-pix_fmt', 'yuv420p',
       '-an', // No audio (will add music later)
+      '-movflags', '+faststart',
       '-y',
       outputPath
     ]);
@@ -277,6 +292,7 @@ class VideoProcessingService {
     double musicVolume = 0.3,
     bool fadeIn = true,
     bool fadeOut = true,
+    AppSettings? settings,
   }) async {
     _ensureInitialized();
     
@@ -296,17 +312,46 @@ class VideoProcessingService {
     
     final videoDuration = double.parse(probeResult.stdout.toString().trim());
     
-    // Add music as audio track - simpler approach
+    // إعدادات الجودة بناءً على bitrate - محسّنة للسرعة
+    final bitrate = settings?.exportSettings.bitrate ?? 5000;
+    String crf;
+    String preset;
+    
+    // استخدام presets أسرع مع جودة جيدة
+    if (bitrate >= 8000) {
+      crf = '20'; // Very high quality (كان 18)
+      preset = 'medium'; // أسرع (كان slow)
+    } else if (bitrate >= 5000) {
+      crf = '26'; // High quality (كان 23)
+      preset = 'veryfast'; // أسرع (كان medium)
+    } else if (bitrate >= 3000) {
+      crf = '28'; // Medium quality (كان 26)
+      preset = 'veryfast'; // نفسه (كان fast)
+    } else {
+      crf = '30'; // Low quality (كان 28)
+      preset = 'ultrafast'; // أسرع (كان veryfast)
+    }
+    
+    // Add music as audio track with quality settings - محسّن للأداء
+    // الموسيقى تتكرر وتستمر حتى نهاية الفيديو
     final result = await _runFFmpeg([
       '-i', videoPath,
+      '-stream_loop', '-1', // تكرار الموسيقى بشكل لا نهائي
       '-i', musicPath,
       '-filter_complex', 
-      '[1:a]volume=$musicVolume,aloop=loop=-1:size=2e+09,atrim=end=${videoDuration.toStringAsFixed(2)}[music]',
+      '[1:a]volume=$musicVolume[music];[music]atrim=0:${videoDuration.toStringAsFixed(2)}[musicfinal]',
       '-map', '0:v',
-      '-map', '[music]',
-      '-c:v', 'copy',
+      '-map', '[musicfinal]',
+      '-c:v', 'libx264',
+      '-preset', preset,
+      '-crf', crf,
+      '-b:v', '${bitrate}k',
+      '-pix_fmt', 'yuv420p',
+      '-max_muxing_queue_size', '1024', // تحديد استهلاك الذاكرة
       '-c:a', 'aac',
-      '-shortest',
+      '-b:a', '${settings?.exportSettings.audioBitrate ?? 192}k',
+      '-movflags', '+faststart',
+      '-t', videoDuration.toStringAsFixed(2), // مدة الفيديو النهائي
       '-y',
       outputPath
     ]);
@@ -416,6 +461,7 @@ class VideoProcessingService {
     String? musicPath,
     required AppSettings settings,
     required EditMode mode,
+    String? outputFileName,
   }) async {
     _ensureInitialized();
     
@@ -425,6 +471,9 @@ class VideoProcessingService {
     Directory(outputDir).createSync(recursive: true);
     final tempDir = Directory(path.join(outputDir, 'temp'));
     tempDir.createSync(recursive: true);
+    
+    // استخدام اسم فريد للملف النهائي
+    final uniqueFileName = outputFileName ?? 'video_${DateTime.now().millisecondsSinceEpoch}';
     
     try {
       // Step 1: Split or prepare videos
@@ -490,7 +539,12 @@ class VideoProcessingService {
           final portraitResult = await _runFFmpeg([
             '-i', currentPath,
             '-vf', 'scale=${settings.exportSettings.resolution.portraitWidth}:${settings.exportSettings.resolution.portraitHeight}:force_original_aspect_ratio=increase,crop=${settings.exportSettings.resolution.portraitWidth}:${settings.exportSettings.resolution.portraitHeight}',
-            '-c:a', 'copy',
+            '-c:v', 'libx264',
+            '-preset', 'veryfast', // تسريع (كان medium)
+            '-crf', '26', // جودة جيدة (كان 23)
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'copy', // نسخ الصوت بدون إعادة تشفير
+            '-movflags', '+faststart',
             '-y',
             portraitPath
           ]);
@@ -544,7 +598,7 @@ class VideoProcessingService {
               'Clip $clipNum/$totalClips: Adding music to full video...',
             );
             
-            final finalPath = path.join(outputDir, 'final_video_$clipNum.mp4');
+            final finalPath = path.join(outputDir, '${uniqueFileName}_$clipNum.mp4');
             
             try {
               await addBackgroundMusic(
@@ -552,6 +606,7 @@ class VideoProcessingService {
                 musicPath: musicPath,
                 outputPath: finalPath,
                 musicVolume: 0.3,
+                settings: settings,
               );
               currentPath = finalPath;
               outputVideos.add(currentPath);
@@ -559,13 +614,13 @@ class VideoProcessingService {
             } catch (e) {
               print('Warning: Failed to add music: $e');
               // Save without music
-              final finalPath = path.join(outputDir, 'final_video_$clipNum.mp4');
+              final finalPath = path.join(outputDir, '${uniqueFileName}_$clipNum.mp4');
               await File(currentPath).copy(finalPath);
               outputVideos.add(finalPath);
             }
           } else {
             // No music - just copy to final output
-            final finalPath = path.join(outputDir, 'final_video_$clipNum.mp4');
+            final finalPath = path.join(outputDir, '${uniqueFileName}_$clipNum.mp4');
             await File(currentPath).copy(finalPath);
             outputVideos.add(finalPath);
           }

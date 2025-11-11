@@ -145,6 +145,19 @@ class FileImportService {
     }
   }
 
+  /// Select output folder for export
+  Future<String?> selectOutputFolder() async {
+    try {
+      String? folderPath = await FilePicker.platform.getDirectoryPath(
+        dialogTitle: 'Select Output Folder',
+      );
+      return folderPath;
+    } catch (e) {
+      print('Error selecting output folder: $e');
+      return null;
+    }
+  }
+
   /// Create VideoClip from file path
   Future<VideoClip?> _createVideoClipFromFile(String filePath) async {
     try {

@@ -1,504 +1,1197 @@
-import 'dart:io';
+﻿import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:desktop_drop/desktop_drop.dart';
-import 'package:cross_file/cross_file.dart';
-import 'package:video_player/video_player.dart';
-import 'package:file_picker/file_picker.dart';
 import '../core/theme/app_theme.dart';
-import '../services/timeline_service.dart';
-import '../models/timeline.dart';
+import '../models/app_settings.dart';
 import '../providers/app_providers.dart';
+import '../services/file_import_service.dart';
+import '../services/video_processing_service_cli.dart';
 
-/// Timeline Editor Screen - Functional drag & drop timeline editor
 class TimelineEditorScreen extends ConsumerStatefulWidget {
-  final List<String> splitClips;
+  final List<String>? splitClips;
 
-  const TimelineEditorScreen({
-    super.key,
-    required this.splitClips,
-  });
+  const TimelineEditorScreen({super.key, this.splitClips});
 
   @override
   ConsumerState<TimelineEditorScreen> createState() => _TimelineEditorScreenState();
 }
 
 class _TimelineEditorScreenState extends ConsumerState<TimelineEditorScreen> {
-  final TimelineService _timelineService = TimelineService();
-  
-  // Multiple Timelines Support
-  final List<Timeline> _timelines = [];
-  int _currentTimelineIndex = 0;
-  
-  bool _isProcessing = false;
-  double _progress = 0.0;
+  final List<TimelineTrack> _timelines = [];
+  final FileImportService _fileService = FileImportService();
+  int? _currentExportingIndex;
+  bool _isExportingAll = false;
 
   @override
   void initState() {
     super.initState();
-    // Create first timeline with split clips
-    _timelines.add(Timeline(
-      name: 'Timeline 1',
-      videoTracks: widget.splitClips.isNotEmpty ? [widget.splitClips.first] : [],
-      audioTrack: null,
-      operations: [],
-    ));
+    if (widget.splitClips != null && widget.splitClips!.isNotEmpty) {
+      for (int i = 0; i < widget.splitClips!.length; i++) {
+        _timelines.add(TimelineTrack(
+          id: i + 1,
+          videoPath: widget.splitClips![i],
+          videoName: widget.splitClips![i].split('\\').last,
+        ));
+      }
+    } else {
+      _timelines.add(TimelineTrack(id: 1));
+    }
   }
 
-  Timeline get _currentTimeline {
-    if (_timelines.isEmpty || _currentTimelineIndex < 0 || _currentTimelineIndex >= _timelines.length) {
-      // Return a default timeline if index is invalid
-      return Timeline(
-        name: 'Empty',
-        videoTracks: [],
-        audioTrack: null,
-        operations: [],
-      );
+  @override
+  void dispose() {
+    // محاولة حذف أي ملفات temp متبقية عند إغلاق التطبيق
+    _cleanupAllTempOnDispose();
+    super.dispose();
+  }
+
+  /// حذف جميع ملفات temp عند إغلاق الشاشة
+  void _cleanupAllTempOnDispose() {
+    // نستخدم compute للحذف في background لعدم تأخير الإغلاق
+    try {
+      // البحث عن مجلدات temp في المواقع الشائعة
+      final commonPaths = [
+        'C:\\Videos\\Output',
+        'C:\\temp',
+        Platform.environment['TEMP'] ?? '',
+      ];
+
+      for (final basePath in commonPaths) {
+        if (basePath.isEmpty) continue;
+        
+        final dir = Directory(basePath);
+        if (dir.existsSync()) {
+          dir.list(recursive: false).listen((entity) {
+            if (entity is Directory) {
+              final name = entity.path.split('\\').last;
+              if (name == 'temp' || name.startsWith('temp_')) {
+                try {
+                  entity.deleteSync(recursive: true);
+                  print('✓ Cleaned up on dispose: ${entity.path}');
+                } catch (e) {
+                  // تجاهل الأخطاء عند الإغلاق
+                }
+              }
+            }
+          });
+        }
+      }
+    } catch (e) {
+      // تجاهل أي أخطاء عند الإغلاق
     }
-    return _timelines[_currentTimelineIndex];
   }
 
   void _addTimeline() {
     setState(() {
-      _timelines.add(Timeline(
-        name: 'Timeline ${_timelines.length + 1}',
-        videoTracks: [],
-        audioTrack: null,
-        operations: [],
-      ));
-      _currentTimelineIndex = _timelines.length - 1;
+      _timelines.add(TimelineTrack(id: _timelines.length + 1));
     });
   }
 
-  void _addVideoTrack() {
+  Future<void> _exportTimeline(int index, {String? outputFolder}) async {
+    final timeline = _timelines[index];
+    
+    if (timeline.videoPath == null) {
+      _showMessage('⚠️ Please add a video to Timeline ${timeline.id}', isError: true);
+      return;
+    }
+
+    // اختيار مجلد الاستخراج (إذا لم يتم تمريره)
+    String? selectedFolder = outputFolder;
+    if (selectedFolder == null) {
+      selectedFolder = await _fileService.selectOutputFolder();
+      if (selectedFolder == null) {
+        _showMessage('⚠️ Export cancelled - No output folder selected', isError: true);
+        return;
+      }
+    }
+
     setState(() {
-      _currentTimeline.videoTracks.add('');
+      _currentExportingIndex = index;
+      timeline.isExporting = true;
+      timeline.exportProgress = 0.0;
     });
+
+    Directory? tempConcatDir; // لتتبع مجلد temp الخاص بالجمع
+
+    try {
+      final settings = ref.read(settingsProvider);
+      final processingService = VideoProcessingService();
+      await processingService.init();
+
+      processingService.processingUpdates.listen((update) {
+        if (mounted && _currentExportingIndex == index) {
+          setState(() {
+            timeline.exportProgress = update.progress / 100;
+            timeline.exportStatus = update.message;
+          });
+        }
+      });
+
+      // جمع الفيديوهات معاً
+      String mainVideoPath = timeline.videoPath!;
+      
+      // إذا كان هناك فيديو ثاني، نجمعهما معاً
+      if (timeline.secondVideoPath != null && timeline.secondVideoPath!.isNotEmpty) {
+        setState(() {
+          timeline.exportStatus = 'جمع الفيديوهات...';
+          timeline.exportProgress = 0.05;
+        });
+        
+        tempConcatDir = Directory('${selectedFolder}\\temp_concat_${DateTime.now().millisecondsSinceEpoch}');
+        tempConcatDir.createSync(recursive: true);
+        
+        final concatenatedPath = '${tempConcatDir.path}\\concatenated.mp4';
+        
+        // إنشاء ملف قائمة الفيديوهات
+        final listFile = File('${tempConcatDir.path}\\videos_list.txt');
+        listFile.writeAsStringSync(
+          "file '${timeline.videoPath!.replaceAll('\\', '/')}'\n"
+          "file '${timeline.secondVideoPath!.replaceAll('\\', '/')}'\n"
+        );
+        
+        // جمع الفيديوهات باستخدام FFmpeg - محسّن للسرعة
+        final result = await Process.run('ffmpeg', [
+          '-threads', '0', // استخدام كل النوى
+          '-f', 'concat',
+          '-safe', '0',
+          '-i', listFile.path,
+          '-c:v', 'libx264',
+          '-preset', 'veryfast', // تسريع (كان fast)
+          '-crf', '26', // جودة جيدة مع سرعة أفضل (كان 23)
+          '-c:a', 'aac',
+          '-b:a', '192k',
+          '-movflags', '+faststart',
+          '-y',
+          concatenatedPath,
+        ]);
+        
+        if (result.exitCode == 0) {
+          mainVideoPath = concatenatedPath;
+          setState(() {
+            timeline.exportStatus = 'تم جمع الفيديوهات ✓';
+            timeline.exportProgress = 0.1;
+          });
+        } else {
+          print('خطأ في جمع الفيديوهات: ${result.stderr}');
+          // في حالة الفشل، استخدام الفيديو الأول فقط
+          _showMessage('⚠️ Failed to concatenate videos, using first video only', isError: true);
+        }
+      }
+
+      // إنشاء اسم فريد للفيديو النهائي
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final uniqueName = 'timeline_${timeline.id}_$timestamp';
+
+      final results = await processingService.processCompleteWorkflow(
+        inputPath: mainVideoPath,
+        outputDir: selectedFolder,
+        outroPath: timeline.outroPath,
+        musicPath: timeline.musicPath,
+        settings: settings,
+        mode: EditMode.multipleVideos,
+        outputFileName: uniqueName,
+      );
+
+      if (mounted) {
+        setState(() {
+          timeline.isExporting = false;
+          timeline.isCompleted = true;
+          timeline.exportProgress = 1.0;
+          timeline.outputPath = results.isNotEmpty ? results.first : null;
+        });
+
+        _showMessage('✅ Timeline ${timeline.id} exported successfully!');
+
+        if (!_isExportingAll && index < _timelines.length - 1) {
+          await Future.delayed(const Duration(seconds: 1));
+          if (mounted) {
+            _exportTimeline(index + 1);
+          }
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          timeline.isExporting = false;
+          timeline.exportStatus = 'Error: ${e.toString()}';
+        });
+        _showMessage('❌ Export failed: ${e.toString()}', isError: true);
+      }
+    } finally {
+      // حذف ملفات temp بعد العملية
+      await _cleanupTempFiles(selectedFolder, tempConcatDir);
+      
+      if (mounted && _currentExportingIndex == index) {
+        setState(() {
+          _currentExportingIndex = null;
+        });
+      }
+    }
   }
 
-  void _addOperation() {
-    showDialog(
-      context: context,
-      builder: (context) => _OperationPickerDialog(
-        onOperationSelected: (operation) {
-          setState(() {
-            _currentTimeline.operations.add(operation);
-          });
-        },
+  /// حذف جميع الملفات المؤقتة بعد اكتمال العملية
+  Future<void> _cleanupTempFiles(String? outputFolder, Directory? tempConcatDir) async {
+    try {
+      if (mounted) {
+        setState(() {
+          _timelines[_currentExportingIndex ?? 0].exportStatus = 'تنظيف الملفات المؤقتة...';
+        });
+      }
+
+      // 1. حذف مجلد temp الخاص بجمع الفيديوهات
+      if (tempConcatDir != null && await tempConcatDir.exists()) {
+        await tempConcatDir.delete(recursive: true);
+        print('✓ Deleted temp concat directory: ${tempConcatDir.path}');
+      }
+
+      // 2. حذف مجلد temp الخاص بـ FFmpeg processing
+      if (outputFolder != null) {
+        final ffmpegTempDir = Directory('$outputFolder\\temp');
+        if (await ffmpegTempDir.exists()) {
+          await ffmpegTempDir.delete(recursive: true);
+          print('✓ Deleted FFmpeg temp directory: ${ffmpegTempDir.path}');
+        }
+
+        // 3. حذف أي مجلدات temp قديمة متبقية
+        final outputDir = Directory(outputFolder);
+        if (await outputDir.exists()) {
+          await for (final entity in outputDir.list()) {
+            if (entity is Directory && entity.path.contains('temp_concat_')) {
+              try {
+                await entity.delete(recursive: true);
+                print('✓ Deleted old temp directory: ${entity.path}');
+              } catch (e) {
+                print('Warning: Could not delete ${entity.path}: $e');
+              }
+            }
+          }
+        }
+      }
+
+      print('✓ Cleanup completed successfully');
+    } catch (e) {
+      print('Warning: Error during cleanup: $e');
+      // لا نريد أن يفشل التطبيق بسبب فشل الحذف
+    }
+  }
+
+  Future<void> _exportAll() async {
+    // اختيار مجلد الاستخراج مرة واحدة لجميع الفيديوهات
+    final outputFolder = await _fileService.selectOutputFolder();
+    if (outputFolder == null) {
+      _showMessage('⚠️ Export cancelled - No output folder selected', isError: true);
+      return;
+    }
+
+    setState(() {
+      _isExportingAll = true;
+    });
+
+    for (int i = 0; i < _timelines.length; i++) {
+      if (_timelines[i].videoPath != null && !_timelines[i].isCompleted) {
+        await _exportTimeline(i, outputFolder: outputFolder);
+      }
+    }
+
+    // حذف شامل لجميع الملفات المؤقتة بعد الانتهاء من جميع العمليات
+    await _finalCleanup(outputFolder);
+
+    setState(() {
+      _isExportingAll = false;
+    });
+
+    if (mounted) {
+      _showMessage('🎉 All timelines exported successfully!');
+    }
+  }
+
+  /// حذف نهائي شامل لجميع الملفات المؤقتة
+  Future<void> _finalCleanup(String outputFolder) async {
+    try {
+      print('🧹 Starting final cleanup...');
+      
+      final outputDir = Directory(outputFolder);
+      if (!await outputDir.exists()) return;
+
+      int deletedCount = 0;
+      
+      // حذف جميع مجلدات temp ومجلدات temp_concat
+      await for (final entity in outputDir.list()) {
+        if (entity is Directory) {
+          final dirName = entity.path.split('\\').last;
+          if (dirName == 'temp' || 
+              dirName.startsWith('temp_') || 
+              dirName.startsWith('temp_concat_')) {
+            try {
+              await entity.delete(recursive: true);
+              deletedCount++;
+              print('✓ Deleted: ${entity.path}');
+            } catch (e) {
+              print('⚠️ Could not delete ${entity.path}: $e');
+            }
+          }
+        }
+      }
+
+      print('✓ Final cleanup completed - Deleted $deletedCount temp directories');
+    } catch (e) {
+      print('⚠️ Error during final cleanup: $e');
+    }
+  }
+
+  void _showMessage(String message, {bool isError = false}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: isError ? Colors.red : Colors.green,
+        behavior: SnackBarBehavior.floating,
       ),
     );
   }
 
-  Future<void> _handleDrop(List<XFile> files, String trackType, int? trackIndex) async {
-    if (files.isEmpty) return;
-    
-    final file = files.first;
-    final path = file.path;
-    
-    final extension = path.toLowerCase().split('.').last;
-    
-    if (trackType == 'audio') {
-      if (['mp3', 'wav', 'aac', 'm4a', 'ogg'].contains(extension)) {
-        setState(() {
-          _currentTimeline.audioTrack = path;
-        });
-      } else {
-        _showError('Invalid audio file');
-      }
-    } else {
-      if (['mp4', 'mov', 'avi', 'mkv', 'webm'].contains(extension)) {
-        setState(() {
-          if (trackIndex != null && trackIndex < _currentTimeline.videoTracks.length) {
-            _currentTimeline.videoTracks[trackIndex] = path;
-          }
-        });
-      } else {
-        _showError('Invalid video file');
-      }
+  Future<void> _addVideoToTimeline(int index) async {
+    final clip = await _fileService.importVideoFile();
+    if (clip != null && mounted) {
+      setState(() {
+        _timelines[index].videoPath = clip.filePath;
+        _timelines[index].videoName = clip.fileName;
+        // لا تقم بنسخه للخانة الثانية - اجعلها منفصلة
+      });
     }
   }
 
-  // Edit operation parameters
-  Future<void> _editOperation(int index) async {
-    final operation = _currentTimeline.operations[index];
-    final newParams = await showDialog<Map<String, dynamic>>(
+  Future<void> _addSecondVideoToTimeline(int index) async {
+    final clip = await _fileService.importVideoFile();
+    if (clip != null && mounted) {
+      setState(() {
+        _timelines[index].secondVideoPath = clip.filePath;
+        _timelines[index].secondVideoName = clip.fileName;
+      });
+    }
+  }
+
+  Future<void> _addOutroToTimeline(int index) async {
+    final clip = await _fileService.importVideoFile();
+    if (clip != null && mounted) {
+      setState(() {
+        _timelines[index].outroPath = clip.filePath;
+        _timelines[index].outroName = clip.fileName;
+      });
+    }
+  }
+
+  Future<void> _addMusicToTimeline(int index) async {
+    final music = await _fileService.importMusicTrack();
+    if (music != null && mounted) {
+      setState(() {
+        _timelines[index].musicPath = music.filePath;
+        _timelines[index].musicName = music.fileName;
+      });
+    }
+  }
+
+  void _deleteTimeline(int index) {
+    setState(() {
+      _timelines.removeAt(index);
+      for (int i = 0; i < _timelines.length; i++) {
+        _timelines[i].id = i + 1;
+      }
+    });
+  }
+
+  void _handleDropVideo(int index, String path, int slot) {
+    // التحقق إذا كان هناك عدة ملفات (مفصولة بـ |MULTI|)
+    if (path.contains('|MULTI|')) {
+      final files = path.split('|MULTI|');
+      _createTimelinesFromMultipleFiles(index, files, slot);
+      return;
+    }
+    
+    // معالجة ملف واحد (الطريقة القديمة)
+    setState(() {
+      if (slot == 1) {
+        _timelines[index].videoPath = path;
+        _timelines[index].videoName = path.split('\\').last;
+      } else if (slot == 2) {
+        _timelines[index].secondVideoPath = path;
+        _timelines[index].secondVideoName = path.split('\\').last;
+      } else if (slot == 3) {
+        // Music slot
+        _timelines[index].musicPath = path;
+        _timelines[index].musicName = path.split('\\').last;
+      }
+    });
+  }
+
+  /// إنشاء تايم لاين متعددة من ملفات متعددة مع التكرار الدوري
+  Future<void> _createTimelinesFromMultipleFiles(int startIndex, List<String> files, int slot) async {
+    // عرض نافذة تأكيد
+    final slotName = slot == 1 ? 'Video 1' : slot == 2 ? 'Video 2' : 'Music';
+    
+    final confirmed = await showDialog<bool>(
       context: context,
-      builder: (context) => _OperationEditDialog(operation: operation),
+      builder: (context) => AlertDialog(
+        backgroundColor: AppTheme.darkSurface,
+        title: Row(
+          children: [
+            const Icon(Icons.help_outline, color: AppTheme.neonPurple),
+            const SizedBox(width: 8),
+            Text('Create ${files.length} Timelines?', 
+                 style: const TextStyle(color: AppTheme.textPrimary)),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'You dropped ${files.length} files in $slotName.',
+              style: const TextStyle(color: AppTheme.textPrimary),
+            ),
+            const SizedBox(height: 16),
+            const Text(
+              'Choose an option:',
+              style: TextStyle(color: AppTheme.textSecondary, fontSize: 12),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel', style: TextStyle(color: AppTheme.textSecondary)),
+          ),
+          TextButton(
+            onPressed: () {
+              // إضافة يدوياً - استخدام الملف الأول فقط
+              Navigator.pop(context, null);
+              setState(() {
+                final path = files.first;
+                if (slot == 1) {
+                  _timelines[startIndex].videoPath = path;
+                  _timelines[startIndex].videoName = path.split('\\').last;
+                } else if (slot == 2) {
+                  _timelines[startIndex].secondVideoPath = path;
+                  _timelines[startIndex].secondVideoName = path.split('\\').last;
+                } else if (slot == 3) {
+                  _timelines[startIndex].musicPath = path;
+                  _timelines[startIndex].musicName = path.split('\\').last;
+                }
+              });
+              _showMessage('✓ Added first file manually', isError: false);
+            },
+            child: const Text('Add First File Only', style: TextStyle(color: AppTheme.neonBlue)),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.neonPurple,
+            ),
+            child: Text('Create ${files.length} Timelines', 
+                        style: const TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
     );
-
-    if (newParams != null) {
-      setState(() {
-        _currentTimeline.operations[index] = VideoOperation(
-          type: operation.type,
-          parameters: newParams,
-        );
-      });
-    }
-  }
-
-  void _showError(String message) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(message), backgroundColor: Colors.red),
-      );
-    }
-  }
-
-  // ACTUAL EXPORT FUNCTIONALITY
-  Future<void> _exportTimeline() async {
-    final timeline = _currentTimeline;
     
-    // Validate
-    if (timeline.videoTracks.isEmpty || timeline.videoTracks.every((t) => t.isEmpty)) {
-      _showError('Add at least one video to export');
-      return;
-    }
+    if (confirmed != true) return;
+    
+    setState(() {
+      // جمع كل الملفات حسب النوع من التايم لاين الحالية
+      final video1Files = <String>[];
+      final video2Files = <String>[];
+      final musicFiles = <String>[];
+      
+      // إضافة الملفات الجديدة حسب slot
+      if (slot == 1) {
+        video1Files.addAll(files);
+        // الاحتفاظ بالملفات الموجودة في slots الأخرى
+        if (_timelines[startIndex].secondVideoPath != null) {
+          video2Files.add(_timelines[startIndex].secondVideoPath!);
+        }
+        if (_timelines[startIndex].musicPath != null) {
+          musicFiles.add(_timelines[startIndex].musicPath!);
+        }
+      } else if (slot == 2) {
+        video2Files.addAll(files);
+        if (_timelines[startIndex].videoPath != null) {
+          video1Files.add(_timelines[startIndex].videoPath!);
+        }
+        if (_timelines[startIndex].musicPath != null) {
+          musicFiles.add(_timelines[startIndex].musicPath!);
+        }
+      } else if (slot == 3) {
+        musicFiles.addAll(files);
+        if (_timelines[startIndex].videoPath != null) {
+          video1Files.add(_timelines[startIndex].videoPath!);
+        }
+        if (_timelines[startIndex].secondVideoPath != null) {
+          video2Files.add(_timelines[startIndex].secondVideoPath!);
+        }
+      }
+      
+      // تحديد العدد الأقصى من الملفات
+      final maxFiles = [video1Files.length, video2Files.length, musicFiles.length]
+          .reduce((a, b) => a > b ? a : b);
+      
+      if (maxFiles == 0) return;
+      
+      // حفظ العمليات والخيارات من التايم لاين الحالية قبل حذفها
+      final savedOperations = List<String>.from(_timelines[startIndex].operations);
+      final savedOutroPath = _timelines[startIndex].outroPath;
+      final savedOutroName = _timelines[startIndex].outroName;
+      
+      // حذف التايم لاين الحالية
+      _timelines.removeAt(startIndex);
+      
+      // إنشاء تايم لاين جديدة بالتكرار الدوري
+      for (int i = 0; i < maxFiles; i++) {
+        final timeline = TimelineTrack(id: startIndex + i + 1);
+        
+        // استخدام modulo للتكرار الدوري
+        if (video1Files.isNotEmpty) {
+          final path = video1Files[i % video1Files.length];
+          timeline.videoPath = path;
+          timeline.videoName = path.split('\\').last;
+        }
+        
+        if (video2Files.isNotEmpty) {
+          final path = video2Files[i % video2Files.length];
+          timeline.secondVideoPath = path;
+          timeline.secondVideoName = path.split('\\').last;
+        }
+        
+        if (musicFiles.isNotEmpty) {
+          final path = musicFiles[i % musicFiles.length];
+          timeline.musicPath = path;
+          timeline.musicName = path.split('\\').last;
+        }
+        
+        // نسخ العمليات والخيارات المحفوظة
+        timeline.operations = List.from(savedOperations);
+        timeline.outroPath = savedOutroPath;
+        timeline.outroName = savedOutroName;
+        
+        _timelines.insert(startIndex + i, timeline);
+      }
+      
+      // إعادة ترقيم جميع التايم لاين
+      for (int i = 0; i < _timelines.length; i++) {
+        _timelines[i].id = i + 1;
+      }
+      
+      // عرض رسالة نجاح
+      _showMessage('✅ Created $maxFiles timelines successfully', isError: false);
+    });
+  }
 
-    // Pick output location
-    final result = await FilePicker.platform.saveFile(
-      dialogTitle: 'Save Exported Video',
-      fileName: 'exported_${DateTime.now().millisecondsSinceEpoch}.mp4',
-      type: FileType.video,
+  void _showOperationDialog(int index) {
+    final timeline = _timelines[index];
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppTheme.darkSurface,
+        title: Row(
+          children: [
+            const Icon(Icons.settings, color: AppTheme.neonPurple),
+            const SizedBox(width: 8),
+            Text('Timeline ${timeline.id} - Operations', 
+                 style: const TextStyle(color: AppTheme.textPrimary)),
+          ],
+        ),
+        content: SizedBox(
+          width: 450,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+              // عرض العمليات المضافة
+              if (timeline.operations.isNotEmpty) ...[
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: AppTheme.neonBlue.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: AppTheme.neonBlue.withOpacity(0.3)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Row(
+                        children: [
+                          Icon(Icons.check_circle, color: AppTheme.neonBlue, size: 18),
+                          SizedBox(width: 8),
+                          Text(
+                            'Active Operations',
+                            style: TextStyle(
+                              color: AppTheme.neonBlue,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 14,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      ...timeline.operations.map((op) => Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.arrow_right, color: AppTheme.textSecondary, size: 16),
+                            const SizedBox(width: 4),
+                            Expanded(
+                              child: Text(
+                                op,
+                                style: const TextStyle(color: AppTheme.textPrimary, fontSize: 13),
+                              ),
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.close, color: Colors.red, size: 18),
+                              onPressed: () {
+                                setState(() {
+                                  timeline.operations.remove(op);
+                                });
+                                Navigator.pop(context);
+                                _showOperationDialog(index);
+                              },
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(),
+                              tooltip: 'Remove operation',
+                            ),
+                          ],
+                        ),
+                      )),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                const Divider(color: AppTheme.darkSurfaceVariant),
+                const SizedBox(height: 16),
+              ],
+              // خيارات العمليات المتاحة
+              const Text(
+                'Add Operation:',
+                style: TextStyle(
+                  color: AppTheme.textSecondary,
+                  fontSize: 13,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 12),
+              _OperationOption(
+                icon: Icons.crop,
+                title: 'Crop to 9:16',
+                description: 'Convert to portrait format',
+                onTap: () {
+                  setState(() {
+                    if (!timeline.operations.contains('Crop to 9:16')) {
+                      timeline.operations.add('Crop to 9:16');
+                    }
+                  });
+                  Navigator.pop(context);
+                  _showMessage('✓ Crop operation added');
+                },
+              ),
+              const SizedBox(height: 12),
+              _OperationOption(
+                icon: Icons.volume_off,
+                title: 'Remove Audio',
+                description: 'Remove original audio track',
+                onTap: () {
+                  setState(() {
+                    if (!timeline.operations.contains('Remove Audio')) {
+                      timeline.operations.add('Remove Audio');
+                    }
+                  });
+                  Navigator.pop(context);
+                  _showMessage('✓ Remove audio operation added');
+                },
+              ),
+              const SizedBox(height: 12),
+              _OperationOption(
+                icon: Icons.auto_fix_high,
+                title: 'Add Effects',
+                description: 'Apply random effects',
+                onTap: () {
+                  setState(() {
+                    if (!timeline.operations.contains('Add Effects')) {
+                      timeline.operations.add('Add Effects');
+                    }
+                  });
+                  Navigator.pop(context);
+                  _showMessage('✓ Effects operation added');
+                },
+              ),
+              const SizedBox(height: 12),
+              _OperationOption(
+                icon: Icons.speed,
+                title: 'Change Speed',
+                description: 'Adjust playback speed',
+                onTap: () {
+                  setState(() {
+                    if (!timeline.operations.contains('Change Speed')) {
+                      timeline.operations.add('Change Speed');
+                    }
+                  });
+                  Navigator.pop(context);
+                  _showMessage('✓ Speed operation added');
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+          if (timeline.operations.isNotEmpty)
+            TextButton.icon(
+              onPressed: () {
+                setState(() {
+                  timeline.operations.clear();
+                });
+                Navigator.pop(context);
+                _showMessage('All operations cleared');
+              },
+              icon: const Icon(Icons.clear_all, color: Colors.red),
+              label: const Text('Clear All', style: TextStyle(color: Colors.red)),
+            ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close', style: TextStyle(color: AppTheme.neonBlue)),
+          ),
+        ],
+      ),
     );
-
-    if (result == null) return;
-
-    setState(() {
-      _isProcessing = true;
-      _progress = 0.0;
-    });
-
-    try {
-      // Get export settings from provider
-      final settings = ref.read(settingsProvider);
-      
-      await _timelineService.processTimeline(
-        videoTracks: timeline.videoTracks.where((t) => t.isNotEmpty).toList(),
-        audioTrack: timeline.audioTrack,
-        operations: timeline.operations,
-        outputPath: result,
-        exportSettings: settings.exportSettings,
-        onProgress: (progress) {
-          setState(() {
-            _progress = progress;
-          });
-        },
-      );
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('✅ Export completed successfully!'),
-            backgroundColor: Colors.green,
-          ),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Export failed: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    } finally {
-      setState(() {
-        _isProcessing = false;
-        _progress = 0.0;
-      });
-    }
-  }
-
-  // ACTUAL PREVIEW FUNCTIONALITY
-  Future<void> _previewTimeline() async {
-    final timeline = _currentTimeline;
-    
-    if (timeline.videoTracks.isEmpty || timeline.videoTracks.every((t) => t.isEmpty)) {
-      _showError('Add at least one video to preview');
-      return;
-    }
-
-    setState(() {
-      _isProcessing = true;
-      _progress = 0.0;
-    });
-
-    try {
-      // Get export settings from provider
-      final settings = ref.read(settingsProvider);
-      
-      // Create temporary preview file
-      final tempDir = Directory.systemTemp;
-      final previewPath = '${tempDir.path}\\preview_${DateTime.now().millisecondsSinceEpoch}.mp4';
-
-      await _timelineService.previewTimeline(
-        videoTracks: timeline.videoTracks.where((t) => t.isNotEmpty).toList(),
-        audioTrack: timeline.audioTrack,
-        operations: timeline.operations,
-        outputPath: previewPath,
-        exportSettings: settings.exportSettings,
-        onProgress: (progress) {
-          setState(() {
-            _progress = progress;
-          });
-        },
-      );
-
-      setState(() {
-        _isProcessing = false;
-      });
-
-      // Show preview player
-      if (mounted) {
-        await showDialog(
-          context: context,
-          builder: (context) => _PreviewPlayerDialog(videoPath: previewPath),
-        );
-      }
-
-      // Cleanup
-      try {
-        await File(previewPath).delete();
-      } catch (_) {}
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Preview failed: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-      setState(() {
-        _isProcessing = false;
-      });
-    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Timeline Editor'),
-        actions: [
-          // Timeline Selector
-          PopupMenuButton<int>(
-            icon: const Icon(Icons.layers),
-            tooltip: 'Select Timeline',
-            onSelected: (index) {
-              if (index >= 0) {
-                setState(() {
-                  _currentTimelineIndex = index;
-                });
-              }
-            },
-            itemBuilder: (context) => [
-              ..._timelines.asMap().entries.map((entry) {
-                return PopupMenuItem(
-                  value: entry.key,
-                  child: Row(
-                    children: [
-                      if (entry.key == _currentTimelineIndex)
-                        const Icon(Icons.check, size: 16),
-                      const SizedBox(width: 8),
-                      Text(entry.value.name),
-                    ],
-                  ),
+      backgroundColor: AppTheme.darkBackground,
+      body: Column(
+        children: [
+          _buildHeader(),
+          Expanded(
+            child: ListView.builder(
+              padding: const EdgeInsets.all(AppTheme.spacingL),
+              itemCount: _timelines.length,
+              itemBuilder: (context, index) {
+                return _TimelineCard(
+                  timeline: _timelines[index],
+                  isExporting: _currentExportingIndex == index,
+                  onAddVideo: () => _addVideoToTimeline(index),
+                  onAddSecondVideo: () => _addSecondVideoToTimeline(index),
+                  onAddOutro: () => _addOutroToTimeline(index),
+                  onAddMusic: () => _addMusicToTimeline(index),
+                  onExport: () => _exportTimeline(index),
+                  onOperation: () => _showOperationDialog(index),
+                  onDelete: _timelines.length > 1 ? () => _deleteTimeline(index) : null,
+                  onDropVideo: (path, slot) => _handleDropVideo(index, path, slot),
                 );
-              }),
-              const PopupMenuDivider(),
-              PopupMenuItem(
-                value: -1,
-                onTap: () {
-                  // Use Future.microtask to avoid conflict with PopupMenu close
-                  Future.microtask(_addTimeline);
-                },
-                child: const Row(
-                  children: [
-                    Icon(Icons.add, size: 16),
-                    SizedBox(width: 8),
-                    Text('Add New Timeline'),
-                  ],
-                ),
-              ),
-            ],
+              },
+            ),
           ),
-          const SizedBox(width: 8),
+          _buildBottomActions(),
         ],
       ),
-      body: _isProcessing
-          ? Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  CircularProgressIndicator(value: _progress),
-                  const SizedBox(height: 16),
-                  Text('Processing: ${(_progress * 100).toInt()}%'),
-                ],
-              ),
-            )
-          : Row(
+    );
+  }
+
+  Widget _buildHeader() {
+    return Container(
+      padding: const EdgeInsets.all(AppTheme.spacingXL),
+      decoration: BoxDecoration(
+        color: AppTheme.darkSurface,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.3),
+            blurRadius: 10,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          IconButton(
+            icon: const Icon(Icons.arrow_back, color: AppTheme.neonBlue),
+            onPressed: () => Navigator.pop(context),
+          ),
+          const SizedBox(width: AppTheme.spacingM),
+          const Icon(Icons.timeline, size: 32, color: AppTheme.neonPurple),
+          const SizedBox(width: AppTheme.spacingM),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // Main Timeline Area
-                Expanded(
-                  flex: 3,
-                  child: Column(
-                    children: [
-                      // Header with buttons
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        color: AppTheme.cardColor,
-                        child: Row(
-                          children: [
-                            Text(
-                              _currentTimeline.name,
-                              style: const TextStyle(
-                                fontSize: 18,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                            const Spacer(),
-                            ElevatedButton.icon(
-                              onPressed: _previewTimeline,
-                              icon: const Icon(Icons.play_arrow),
-                              label: const Text('Preview'),
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.orange,
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            ElevatedButton.icon(
-                              onPressed: _exportTimeline,
-                              icon: const Icon(Icons.file_download),
-                              label: const Text('Export'),
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.green,
-                              ),
-                            ),
-                          ],
-                        ),
+                Text(
+                  'Timeline Editor',
+                  style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                        color: AppTheme.textPrimary,
+                        fontWeight: FontWeight.bold,
                       ),
-                      
-                      // Timeline Tracks
-                      Expanded(
-                        child: ListView(
-                          padding: const EdgeInsets.all(16),
-                          children: [
-                            // Video Tracks
-                            ..._currentTimeline.videoTracks.asMap().entries.map((entry) {
-                              return _TrackSlot(
-                                trackName: 'Video Track ${entry.key + 1}',
-                                file: _currentTimeline.videoTracks[entry.key],
-                                onFileDrop: (files) => _handleDrop(files, 'video', entry.key),
-                                onFileRemove: () {
-                                  setState(() {
-                                    _currentTimeline.videoTracks[entry.key] = '';
-                                  });
-                                },
-                                onTrackRemove: _currentTimeline.videoTracks.length > 1
-                                    ? () {
-                                        setState(() {
-                                          _currentTimeline.videoTracks.removeAt(entry.key);
-                                        });
-                                      }
-                                    : null,
-                              );
-                            }),
-                            
-                            // Add Track Button
-                            _AddTrackButton(onPressed: _addVideoTrack),
-                            
-                            const SizedBox(height: 24),
-                            
-                            // Audio Track
-                            _TrackSlot(
-                              trackName: 'Audio Track',
-                              file: _currentTimeline.audioTrack ?? '',
-                              onFileDrop: (files) => _handleDrop(files, 'audio', null),
-                              onFileRemove: () {
-                                setState(() {
-                                  _currentTimeline.audioTrack = null;
-                                });
-                              },
-                              isAudioTrack: true,
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
                 ),
-                
-                // Operations Panel
+                Text(
+                  '${_timelines.length} Timeline(s) • ${_timelines.where((t) => t.isCompleted).length} Completed',
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: AppTheme.textSecondary,
+                      ),
+                ),
+              ],
+            ),
+          ),
+          ElevatedButton.icon(
+            onPressed: _isExportingAll || _timelines.every((t) => t.videoPath == null)
+                ? null
+                : _exportAll,
+            icon: _isExportingAll
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                  )
+                : const Icon(Icons.file_download),
+            label: Text(_isExportingAll ? 'Exporting...' : 'EXPORT ALL'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.neonPurple,
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppTheme.spacingXL,
+                vertical: AppTheme.spacingM,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBottomActions() {
+    return Container(
+      padding: const EdgeInsets.all(AppTheme.spacingL),
+      decoration: BoxDecoration(
+        color: AppTheme.darkSurface,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.3),
+            blurRadius: 10,
+            offset: const Offset(0, -2),
+          ),
+        ],
+      ),
+      child: SizedBox(
+        width: double.infinity,
+        child: ElevatedButton.icon(
+          onPressed: _addTimeline,
+          icon: const Icon(Icons.add),
+          label: const Text('ADD TIMELINE'),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: AppTheme.darkSurfaceVariant,
+            padding: const EdgeInsets.symmetric(vertical: AppTheme.spacingM),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _TimelineCard extends StatelessWidget {
+  final TimelineTrack timeline;
+  final bool isExporting;
+  final VoidCallback onAddVideo;
+  final VoidCallback onAddSecondVideo;
+  final VoidCallback onAddOutro;
+  final VoidCallback onAddMusic;
+  final VoidCallback onExport;
+  final VoidCallback onOperation;
+  final VoidCallback? onDelete;
+  final Function(String path, int slot) onDropVideo;
+
+  const _TimelineCard({
+    required this.timeline,
+    required this.isExporting,
+    required this.onAddVideo,
+    required this.onAddSecondVideo,
+    required this.onAddOutro,
+    required this.onAddMusic,
+    required this.onExport,
+    required this.onOperation,
+    this.onDelete,
+    required this.onDropVideo,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: AppTheme.spacingL),
+      decoration: BoxDecoration(
+        color: AppTheme.darkSurface,
+        borderRadius: BorderRadius.circular(AppTheme.radiusLarge),
+        border: Border.all(
+          color: isExporting
+              ? AppTheme.neonBlue
+              : timeline.isCompleted
+                  ? Colors.green
+                  : AppTheme.darkSurfaceVariant,
+          width: 2,
+        ),
+        boxShadow: [
+          if (isExporting)
+            BoxShadow(
+              color: AppTheme.neonBlue.withOpacity(0.3),
+              blurRadius: 15,
+              spreadRadius: 2,
+            ),
+        ],
+      ),
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(AppTheme.spacingL),
+            decoration: BoxDecoration(
+              color: AppTheme.darkBackground,
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(AppTheme.radiusLarge),
+                topRight: Radius.circular(AppTheme.radiusLarge),
+              ),
+            ),
+            child: Row(
+              children: [
                 Container(
-                  width: 300,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: AppTheme.spacingM,
+                    vertical: AppTheme.spacingS,
+                  ),
                   decoration: BoxDecoration(
-                    color: AppTheme.cardColor,
-                    border: Border(
-                      left: BorderSide(color: AppTheme.borderColor, width: 1),
+                    color: AppTheme.neonPurple.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(AppTheme.radiusMedium),
+                  ),
+                  child: Text(
+                    'TIMELINE ${timeline.id}',
+                    style: const TextStyle(
+                      color: AppTheme.neonPurple,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
                     ),
                   ),
-                  child: Column(
-                    children: [
-                      // Operations Header
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          border: Border(
-                            bottom: BorderSide(color: AppTheme.borderColor, width: 1),
-                          ),
-                        ),
-                        child: Row(
-                          children: [
-                            const Text(
-                              'Operations',
-                              style: TextStyle(
-                                fontSize: 16,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                            const Spacer(),
-                            IconButton(
-                              icon: const Icon(Icons.add_circle),
-                              onPressed: _addOperation,
-                              tooltip: 'Add Operation',
-                            ),
-                          ],
-                        ),
-                      ),
-                      
-                      // Operations List
-                      Expanded(
-                        child: _currentTimeline.operations.isEmpty
-                            ? const Center(
-                                child: Text(
-                                  'No operations added\nClick + to add',
-                                  textAlign: TextAlign.center,
-                                  style: TextStyle(color: Colors.grey),
-                                ),
-                              )
-                            : ListView.builder(
-                                padding: const EdgeInsets.all(8),
-                                itemCount: _currentTimeline.operations.length,
-                                itemBuilder: (context, index) {
-                                  final operation = _currentTimeline.operations[index];
-                                  return _OperationCard(
-                                    operation: operation,
-                                    onDelete: () {
-                                      setState(() {
-                                        _currentTimeline.operations.removeAt(index);
-                                      });
-                                    },
-                                    onEdit: () {
-                                      _editOperation(index);
-                                    },
-                                  );
-                                },
-                              ),
-                      ),
-                    ],
+                ),
+                const Spacer(),
+                if (timeline.isCompleted)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: AppTheme.spacingM,
+                      vertical: AppTheme.spacingS,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.green.withOpacity(0.2),
+                      borderRadius: BorderRadius.circular(AppTheme.radiusMedium),
+                    ),
+                    child: const Row(
+                      children: [
+                        Icon(Icons.check_circle, color: Colors.green, size: 16),
+                        SizedBox(width: 4),
+                        Text('Completed', style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold)),
+                      ],
+                    ),
                   ),
+                if (onDelete != null && !isExporting) ...[
+                  const SizedBox(width: AppTheme.spacingM),
+                  IconButton(
+                    icon: const Icon(Icons.delete, color: Colors.red),
+                    onPressed: onDelete,
+                    tooltip: 'Delete Timeline',
+                  ),
+                ],
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(AppTheme.spacingL),
+            child: Row(
+              children: [
+                _MediaSlotWithDrop(
+                  icon: Icons.videocam,
+                  label: 'Video 1',
+                  fileName: timeline.videoName,
+                  onTap: isExporting ? null : onAddVideo,
+                  onDrop: (path) => onDropVideo(path, 1),
+                  color: AppTheme.neonBlue,
+                ),
+                const SizedBox(width: AppTheme.spacingM),
+                _MediaSlotWithDrop(
+                  icon: Icons.videocam,
+                  label: 'Video 2',
+                  fileName: timeline.secondVideoName,
+                  onTap: isExporting ? null : onAddSecondVideo,
+                  onDrop: (path) => onDropVideo(path, 2),
+                  color: AppTheme.neonBlue.withOpacity(0.7),
+                ),
+                const SizedBox(width: AppTheme.spacingM),
+                _MediaSlot(
+                  icon: Icons.add_circle_outline,
+                  label: 'Outro',
+                  fileName: timeline.outroName,
+                  onTap: isExporting ? null : onAddOutro,
+                  color: AppTheme.neonPurple,
+                ),
+                const SizedBox(width: AppTheme.spacingM),
+                _MusicSlotWithDrop(
+                  icon: Icons.music_note,
+                  label: 'Music',
+                  fileName: timeline.musicName,
+                  onTap: isExporting ? null : onAddMusic,
+                  onDrop: (path) => onDropVideo(path, 3),
+                  color: Colors.orange,
+                ),
+                const SizedBox(width: AppTheme.spacingM),
+                _OperationButton(
+                  onTap: isExporting ? null : onOperation,
+                ),
+                const SizedBox(width: AppTheme.spacingM),
+                Expanded(
+                  child: _ExportButton(
+                    timeline: timeline,
+                    isExporting: isExporting,
+                    onExport: onExport,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (isExporting || timeline.exportProgress > 0)
+            _ProgressIndicator(
+              progress: timeline.exportProgress,
+              status: timeline.exportStatus,
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MediaSlot extends StatefulWidget {
+  final IconData icon;
+  final String label;
+  final String? fileName;
+  final VoidCallback? onTap;
+  final Color color;
+
+  const _MediaSlot({
+    required this.icon,
+    required this.label,
+    this.fileName,
+    this.onTap,
+    required this.color,
+  });
+
+  @override
+  State<_MediaSlot> createState() => _MediaSlotState();
+}
+
+class _MediaSlotState extends State<_MediaSlot> {
+  bool _isHovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final hasFile = widget.fileName != null;
+    return MouseRegion(
+      onEnter: (_) => setState(() => _isHovered = true),
+      onExit: (_) => setState(() => _isHovered = false),
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          width: 100,
+          height: 100,
+          decoration: BoxDecoration(
+            color: hasFile ? widget.color.withOpacity(0.15) : AppTheme.darkBackground,
+            borderRadius: BorderRadius.circular(AppTheme.radiusMedium),
+            border: Border.all(
+              color: hasFile
+                  ? widget.color
+                  : _isHovered && widget.onTap != null
+                      ? widget.color.withOpacity(0.5)
+                      : AppTheme.darkSurfaceVariant,
+              width: 2,
+            ),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(widget.icon, color: hasFile ? widget.color : AppTheme.textSecondary, size: 32),
+              const SizedBox(height: AppTheme.spacingS),
+              Text(
+                widget.label,
+                style: TextStyle(
+                  color: hasFile ? widget.color : AppTheme.textSecondary,
+                  fontSize: 11,
+                  fontWeight: hasFile ? FontWeight.bold : FontWeight.normal,
+                ),
+                textAlign: TextAlign.center,
+              ),
+              if (hasFile && widget.fileName != null)
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  child: Text(
+                    widget.fileName!.length > 12 ? '${widget.fileName!.substring(0, 12)}...' : widget.fileName!,
+                    style: const TextStyle(color: AppTheme.textSecondary, fontSize: 9),
+                    textAlign: TextAlign.center,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ExportButton extends StatelessWidget {
+  final TimelineTrack timeline;
+  final bool isExporting;
+  final VoidCallback onExport;
+
+  const _ExportButton({
+    required this.timeline,
+    required this.isExporting,
+    required this.onExport,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final canExport = timeline.videoPath != null && !timeline.isCompleted;
+    return ElevatedButton(
+      onPressed: canExport && !isExporting ? onExport : null,
+      style: ElevatedButton.styleFrom(
+        backgroundColor: timeline.isCompleted
+            ? Colors.green
+            : isExporting
+                ? AppTheme.neonBlue
+                : AppTheme.neonPurple,
+        padding: const EdgeInsets.symmetric(vertical: 20),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppTheme.radiusMedium),
+        ),
+      ),
+      child: isExporting
+          ? const Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: CircularProgressIndicator(strokeWidth: 3, valueColor: AlwaysStoppedAnimation<Color>(Colors.white)),
+                ),
+                SizedBox(height: 8),
+                Text('Exporting...', style: TextStyle(fontSize: 12)),
+              ],
+            )
+          : Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(timeline.isCompleted ? Icons.check_circle : Icons.play_arrow, size: 32),
+                const SizedBox(height: 8),
+                Text(
+                  timeline.isCompleted ? 'Completed' : 'Export',
+                  style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
                 ),
               ],
             ),
@@ -506,192 +1199,456 @@ class _TimelineEditorScreenState extends ConsumerState<TimelineEditorScreen> {
   }
 }
 
-// Track Slot Widget
-class _TrackSlot extends StatefulWidget {
-  final String trackName;
-  final String file;
-  final Function(List<XFile>) onFileDrop;
-  final VoidCallback onFileRemove;
-  final VoidCallback? onTrackRemove;
-  final bool isAudioTrack;
+class _ProgressIndicator extends StatelessWidget {
+  final double progress;
+  final String status;
 
-  const _TrackSlot({
-    required this.trackName,
-    required this.file,
-    required this.onFileDrop,
-    required this.onFileRemove,
-    this.onTrackRemove,
-    this.isAudioTrack = false,
-  });
-
-  @override
-  State<_TrackSlot> createState() => _TrackSlotState();
-}
-
-class _TrackSlotState extends State<_TrackSlot> {
-  bool _isDragging = false;
-
-  @override
-  Widget build(BuildContext context) {
-    final hasFile = widget.file.isNotEmpty;
-    
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: Row(
-        children: [
-          // Track Name
-          SizedBox(
-            width: 120,
-            child: Text(
-              widget.trackName,
-              style: const TextStyle(fontWeight: FontWeight.w500),
-            ),
-          ),
-          
-          // Drop Zone
-          Expanded(
-            child: DropTarget(
-              onDragEntered: (_) => setState(() => _isDragging = true),
-              onDragExited: (_) => setState(() => _isDragging = false),
-              onDragDone: (details) {
-                setState(() => _isDragging = false);
-                widget.onFileDrop(details.files);
-              },
-              child: Container(
-                height: 60,
-                decoration: BoxDecoration(
-                  color: _isDragging ? AppTheme.accentColor.withOpacity(0.2) : AppTheme.cardColor,
-                  border: Border.all(
-                    color: _isDragging ? AppTheme.accentColor : AppTheme.borderColor,
-                    width: 2,
-                  ),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: hasFile
-                    ? _FileChip(
-                        fileName: widget.file.split('\\').last,
-                        icon: widget.isAudioTrack ? Icons.music_note : Icons.movie,
-                        onRemove: widget.onFileRemove,
-                      )
-                    : Center(
-                        child: Text(
-                          'Drop ${widget.isAudioTrack ? 'audio' : 'video'} here',
-                          style: TextStyle(color: Colors.grey[600]),
-                        ),
-                      ),
-              ),
-            ),
-          ),
-          
-          // Remove Track Button
-          if (widget.onTrackRemove != null) ...[
-            const SizedBox(width: 8),
-            IconButton(
-              icon: const Icon(Icons.delete, color: Colors.red),
-              onPressed: widget.onTrackRemove,
-              tooltip: 'Remove Track',
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-}
-
-// File Chip Widget
-class _FileChip extends StatelessWidget {
-  final String fileName;
-  final IconData icon;
-  final VoidCallback onRemove;
-
-  const _FileChip({
-    required this.fileName,
-    required this.icon,
-    required this.onRemove,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.all(8),
-      child: Row(
-        children: [
-          Icon(icon, color: AppTheme.accentColor),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              fileName,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontWeight: FontWeight.w500),
-            ),
-          ),
-          IconButton(
-            icon: const Icon(Icons.close, size: 18),
-            onPressed: onRemove,
-            tooltip: 'Remove',
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// Add Track Button
-class _AddTrackButton extends StatelessWidget {
-  final VoidCallback onPressed;
-
-  const _AddTrackButton({required this.onPressed});
+  const _ProgressIndicator({required this.progress, required this.status});
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      height: 60,
-      margin: const EdgeInsets.only(bottom: 12, left: 120),
-      child: OutlinedButton.icon(
-        onPressed: onPressed,
-        icon: const Icon(Icons.add),
-        label: const Text('Add Video Track'),
-        style: OutlinedButton.styleFrom(
-          side: BorderSide(color: AppTheme.borderColor),
+      padding: const EdgeInsets.all(AppTheme.spacingL),
+      decoration: const BoxDecoration(
+        color: AppTheme.darkBackground,
+        borderRadius: BorderRadius.only(
+          bottomLeft: Radius.circular(AppTheme.radiusLarge),
+          bottomRight: Radius.circular(AppTheme.radiusLarge),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Expanded(
+                child: Text(
+                  status,
+                  style: const TextStyle(color: AppTheme.textSecondary, fontSize: 13),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              Text(
+                '${(progress * 100).toInt()}%',
+                style: const TextStyle(color: AppTheme.neonBlue, fontWeight: FontWeight.bold, fontSize: 14),
+              ),
+            ],
+          ),
+          const SizedBox(height: AppTheme.spacingS),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(AppTheme.radiusSmall),
+            child: LinearProgressIndicator(
+              value: progress,
+              minHeight: 8,
+              backgroundColor: AppTheme.darkSurfaceVariant,
+              valueColor: AlwaysStoppedAnimation<Color>(
+                progress < 0.3
+                    ? AppTheme.neonPurple
+                    : progress < 0.7
+                        ? AppTheme.neonBlue
+                        : Colors.green,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// Media Slot with Drag & Drop Support
+class _MediaSlotWithDrop extends StatefulWidget {
+  final IconData icon;
+  final String label;
+  final String? fileName;
+  final VoidCallback? onTap;
+  final Function(String) onDrop;
+  final Color color;
+
+  const _MediaSlotWithDrop({
+    required this.icon,
+    required this.label,
+    this.fileName,
+    this.onTap,
+    required this.onDrop,
+    required this.color,
+  });
+
+  @override
+  State<_MediaSlotWithDrop> createState() => _MediaSlotWithDropState();
+}
+
+class _MediaSlotWithDropState extends State<_MediaSlotWithDrop> {
+  bool _isHovered = false;
+  bool _isDragging = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final hasFile = widget.fileName != null;
+
+    return DropTarget(
+      onDragEntered: (_) => setState(() => _isDragging = true),
+      onDragExited: (_) => setState(() => _isDragging = false),
+      onDragDone: (details) {
+        setState(() => _isDragging = false);
+        if (details.files.isNotEmpty) {
+          // إذا كان هناك أكثر من ملف، نرسلهم جميعاً
+          final videoFiles = details.files.where((file) {
+            final lowerPath = file.path.toLowerCase();
+            return lowerPath.endsWith('.mp4') || 
+                   lowerPath.endsWith('.mov') || 
+                   lowerPath.endsWith('.avi') ||
+                   lowerPath.endsWith('.mkv');
+          }).toList();
+          
+          if (videoFiles.isNotEmpty) {
+            // إذا كان ملف واحد، استخدم الطريقة القديمة
+            if (videoFiles.length == 1) {
+              widget.onDrop(videoFiles.first.path);
+            } else {
+              // إذا كان أكثر من ملف، نرسل قائمة الملفات
+              widget.onDrop(videoFiles.map((f) => f.path).join('|MULTI|'));
+            }
+          }
+        }
+      },
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _isHovered = true),
+        onExit: (_) => setState(() => _isHovered = false),
+        child: GestureDetector(
+          onTap: widget.onTap,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            width: 100,
+            height: 100,
+            decoration: BoxDecoration(
+              color: _isDragging
+                  ? widget.color.withOpacity(0.3)
+                  : hasFile
+                      ? widget.color.withOpacity(0.15)
+                      : AppTheme.darkBackground,
+              borderRadius: BorderRadius.circular(AppTheme.radiusMedium),
+              border: Border.all(
+                color: _isDragging
+                    ? widget.color
+                    : hasFile
+                        ? widget.color
+                        : _isHovered && widget.onTap != null
+                            ? widget.color.withOpacity(0.5)
+                            : AppTheme.darkSurfaceVariant,
+                width: _isDragging ? 3 : 2,
+              ),
+            ),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  widget.icon,
+                  color: hasFile || _isDragging ? widget.color : AppTheme.textSecondary,
+                  size: 32,
+                ),
+                const SizedBox(height: AppTheme.spacingS),
+                Text(
+                  widget.label,
+                  style: TextStyle(
+                    color: hasFile || _isDragging ? widget.color : AppTheme.textSecondary,
+                    fontSize: 11,
+                    fontWeight: hasFile ? FontWeight.bold : FontWeight.normal,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+                if (hasFile && widget.fileName != null)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: Text(
+                      widget.fileName!.length > 12
+                          ? '${widget.fileName!.substring(0, 12)}...'
+                          : widget.fileName!,
+                      style: const TextStyle(color: AppTheme.textSecondary, fontSize: 9),
+                      textAlign: TextAlign.center,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+              ],
+            ),
+          ),
         ),
       ),
     );
   }
 }
 
-// Operation Card Widget
-class _OperationCard extends StatelessWidget {
-  final VideoOperation operation;
-  final VoidCallback onDelete;
-  final VoidCallback onEdit;
+// Music Slot with Drag & Drop (Audio files only)
+class _MusicSlotWithDrop extends StatefulWidget {
+  final IconData icon;
+  final String label;
+  final String? fileName;
+  final VoidCallback? onTap;
+  final Function(String) onDrop;
+  final Color color;
 
-  const _OperationCard({
-    required this.operation,
-    required this.onDelete,
-    required this.onEdit,
+  const _MusicSlotWithDrop({
+    required this.icon,
+    required this.label,
+    this.fileName,
+    this.onTap,
+    required this.onDrop,
+    required this.color,
+  });
+
+  @override
+  State<_MusicSlotWithDrop> createState() => _MusicSlotWithDropState();
+}
+
+class _MusicSlotWithDropState extends State<_MusicSlotWithDrop> {
+  bool _isHovered = false;
+  bool _isDragging = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final hasFile = widget.fileName != null;
+
+    return DropTarget(
+      onDragEntered: (_) => setState(() => _isDragging = true),
+      onDragExited: (_) => setState(() => _isDragging = false),
+      onDragDone: (details) {
+        setState(() => _isDragging = false);
+        if (details.files.isNotEmpty) {
+          // جمع الملفات الصوتية فقط
+          final audioFiles = details.files.where((file) {
+            final lowerPath = file.path.toLowerCase();
+            return lowerPath.endsWith('.mp3') || 
+                   lowerPath.endsWith('.wav') || 
+                   lowerPath.endsWith('.m4a') ||
+                   lowerPath.endsWith('.aac') ||
+                   lowerPath.endsWith('.ogg') ||
+                   lowerPath.endsWith('.flac');
+          }).toList();
+          
+          if (audioFiles.isNotEmpty) {
+            // إذا كان ملف واحد، استخدم الطريقة القديمة
+            if (audioFiles.length == 1) {
+              widget.onDrop(audioFiles.first.path);
+            } else {
+              // إذا كان أكثر من ملف، نرسل قائمة الملفات
+              widget.onDrop(audioFiles.map((f) => f.path).join('|MULTI|'));
+            }
+          } else if (details.files.isNotEmpty) {
+            // عرض رسالة خطأ إذا كان الملف ليس صوت
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('⚠️ Please drop an audio file (mp3, wav, m4a, aac, ogg, flac)'),
+                backgroundColor: Colors.orange,
+                behavior: SnackBarBehavior.floating,
+              ),
+            );
+          }
+        }
+      },
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _isHovered = true),
+        onExit: (_) => setState(() => _isHovered = false),
+        child: GestureDetector(
+          onTap: widget.onTap,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            width: 100,
+            height: 100,
+            decoration: BoxDecoration(
+              color: _isDragging
+                  ? widget.color.withOpacity(0.3)
+                  : hasFile
+                      ? widget.color.withOpacity(0.15)
+                      : AppTheme.darkBackground,
+              borderRadius: BorderRadius.circular(AppTheme.radiusMedium),
+              border: Border.all(
+                color: _isDragging
+                    ? widget.color
+                    : hasFile
+                        ? widget.color
+                        : _isHovered && widget.onTap != null
+                            ? widget.color.withOpacity(0.5)
+                            : AppTheme.darkSurfaceVariant,
+                width: _isDragging ? 3 : 2,
+              ),
+            ),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  widget.icon,
+                  color: hasFile || _isDragging ? widget.color : AppTheme.textSecondary,
+                  size: 32,
+                ),
+                const SizedBox(height: AppTheme.spacingS),
+                Text(
+                  widget.label,
+                  style: TextStyle(
+                    color: hasFile || _isDragging ? widget.color : AppTheme.textSecondary,
+                    fontSize: 11,
+                    fontWeight: hasFile ? FontWeight.bold : FontWeight.normal,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+                if (hasFile && widget.fileName != null)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: Text(
+                      widget.fileName!.length > 12
+                          ? '${widget.fileName!.substring(0, 12)}...'
+                          : widget.fileName!,
+                      style: const TextStyle(color: AppTheme.textSecondary, fontSize: 9),
+                      textAlign: TextAlign.center,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                if (_isDragging)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 4),
+                    child: Text(
+                      'Drop audio',
+                      style: TextStyle(
+                        color: Colors.orange,
+                        fontSize: 9,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Operation Button Widget
+class _OperationButton extends StatefulWidget {
+  final VoidCallback? onTap;
+
+  const _OperationButton({this.onTap});
+
+  @override
+  State<_OperationButton> createState() => _OperationButtonState();
+}
+
+class _OperationButtonState extends State<_OperationButton> {
+  bool _isHovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      onEnter: (_) => setState(() => _isHovered = true),
+      onExit: (_) => setState(() => _isHovered = false),
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          width: 100,
+          height: 100,
+          decoration: BoxDecoration(
+            color: _isHovered
+                ? AppTheme.neonPurple.withOpacity(0.15)
+                : AppTheme.darkBackground,
+            borderRadius: BorderRadius.circular(AppTheme.radiusMedium),
+            border: Border.all(
+              color: _isHovered
+                  ? AppTheme.neonPurple
+                  : AppTheme.darkSurfaceVariant,
+              width: 2,
+            ),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.settings,
+                color: _isHovered ? AppTheme.neonPurple : AppTheme.textSecondary,
+                size: 32,
+              ),
+              const SizedBox(height: AppTheme.spacingS),
+              Text(
+                'Operation',
+                style: TextStyle(
+                  color: _isHovered ? AppTheme.neonPurple : AppTheme.textSecondary,
+                  fontSize: 11,
+                  fontWeight: _isHovered ? FontWeight.bold : FontWeight.normal,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Operation Option Widget for Dialog
+class _OperationOption extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String description;
+  final VoidCallback onTap;
+
+  const _OperationOption({
+    required this.icon,
+    required this.title,
+    required this.description,
+    required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      margin: const EdgeInsets.only(bottom: 8),
-      color: AppTheme.cardColor,
-      child: ListTile(
-        leading: Icon(operation.icon, color: AppTheme.accentColor),
-        title: Text(operation.name),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(AppTheme.radiusMedium),
+      child: Container(
+        padding: const EdgeInsets.all(AppTheme.spacingM),
+        decoration: BoxDecoration(
+          color: AppTheme.darkBackground,
+          borderRadius: BorderRadius.circular(AppTheme.radiusMedium),
+          border: Border.all(color: AppTheme.darkSurfaceVariant),
+        ),
+        child: Row(
           children: [
-            IconButton(
-              icon: const Icon(Icons.edit, size: 18),
-              onPressed: onEdit,
-              tooltip: 'Edit',
+            Container(
+              padding: const EdgeInsets.all(AppTheme.spacingS),
+              decoration: BoxDecoration(
+                color: AppTheme.neonPurple.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(AppTheme.radiusSmall),
+              ),
+              child: Icon(icon, color: AppTheme.neonPurple, size: 24),
             ),
-            IconButton(
-              icon: const Icon(Icons.delete, size: 18, color: Colors.red),
-              onPressed: onDelete,
-              tooltip: 'Delete',
+            const SizedBox(width: AppTheme.spacingM),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                      color: AppTheme.textPrimary,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 14,
+                    ),
+                  ),
+                  Text(
+                    description,
+                    style: const TextStyle(
+                      color: AppTheme.textSecondary,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ),
             ),
+            const Icon(Icons.arrow_forward_ios, color: AppTheme.textSecondary, size: 16),
           ],
         ),
       ),
@@ -699,349 +1656,32 @@ class _OperationCard extends StatelessWidget {
   }
 }
 
-// Operation Picker Dialog
-class _OperationPickerDialog extends StatelessWidget {
-  final Function(VideoOperation) onOperationSelected;
+class TimelineTrack {
+  int id;
+  String? videoPath;
+  String? videoName;
+  String? secondVideoPath;
+  String? secondVideoName;
+  String? outroPath;
+  String? outroName;
+  String? musicPath;
+  String? musicName;
+  bool isExporting = false;
+  bool isCompleted = false;
+  double exportProgress = 0.0;
+  String exportStatus = '';
+  String? outputPath;
+  List<String> operations = []; // العمليات المضافة
 
-  const _OperationPickerDialog({required this.onOperationSelected});
-
-  @override
-  Widget build(BuildContext context) {
-    final operations = [
-      VideoOperation(
-        type: OperationType.removeAudio,
-        parameters: {},
-      ),
-      VideoOperation(
-        type: OperationType.portrait,
-        parameters: {},
-      ),
-      VideoOperation(
-        type: OperationType.speed,
-        parameters: {'speed': 1.0},
-      ),
-      VideoOperation(
-        type: OperationType.brightness,
-        parameters: {'brightness': 0.0},
-      ),
-      VideoOperation(
-        type: OperationType.contrast,
-        parameters: {'contrast': 1.0},
-      ),
-      VideoOperation(
-        type: OperationType.saturation,
-        parameters: {'saturation': 1.0},
-      ),
-      VideoOperation(
-        type: OperationType.fade,
-        parameters: {'duration': 0.5},
-      ),
-      VideoOperation(
-        type: OperationType.zoom,
-        parameters: {'zoom': 1.0},
-      ),
-    ];
-
-    return AlertDialog(
-      title: const Text('Add Operation'),
-      content: SizedBox(
-        width: 400,
-        child: ListView.builder(
-          shrinkWrap: true,
-          itemCount: operations.length,
-          itemBuilder: (context, index) {
-            final operation = operations[index];
-            return ListTile(
-              leading: Icon(operation.icon),
-              title: Text(operation.name),
-              onTap: () {
-                Navigator.pop(context);
-                onOperationSelected(operation);
-              },
-            );
-          },
-        ),
-      ),
-    );
-  }
-}
-
-// Preview Player Dialog
-class _PreviewPlayerDialog extends StatefulWidget {
-  final String videoPath;
-
-  const _PreviewPlayerDialog({required this.videoPath});
-
-  @override
-  State<_PreviewPlayerDialog> createState() => _PreviewPlayerDialogState();
-}
-
-class _PreviewPlayerDialogState extends State<_PreviewPlayerDialog> {
-  late VideoPlayerController _controller;
-  bool _isInitialized = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = VideoPlayerController.file(File(widget.videoPath))
-      ..initialize().then((_) {
-        setState(() {
-          _isInitialized = true;
-        });
-        _controller.play();
-      });
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('Preview'),
-      content: _isInitialized
-          ? AspectRatio(
-              aspectRatio: _controller.value.aspectRatio,
-              child: VideoPlayer(_controller),
-            )
-          : const Center(child: CircularProgressIndicator()),
-      actions: [
-        TextButton(
-          onPressed: () {
-            if (_controller.value.isPlaying) {
-              _controller.pause();
-            } else {
-              _controller.play();
-            }
-          },
-          child: const Text('Play/Pause'),
-        ),
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Close'),
-        ),
-      ],
-    );
-  }
-}
-
-// Operation Edit Dialog
-class _OperationEditDialog extends StatefulWidget {
-  final VideoOperation operation;
-
-  const _OperationEditDialog({required this.operation});
-
-  @override
-  State<_OperationEditDialog> createState() => _OperationEditDialogState();
-}
-
-class _OperationEditDialogState extends State<_OperationEditDialog> {
-  late Map<String, dynamic> _params;
-
-  @override
-  void initState() {
-    super.initState();
-    _params = Map<String, dynamic>.from(widget.operation.parameters);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      backgroundColor: AppTheme.darkSurface,
-      title: Text(
-        'Edit ${widget.operation.type.name}',
-        style: const TextStyle(color: AppTheme.textPrimary),
-      ),
-      content: SizedBox(
-        width: 400,
-        child: _buildParameterEditor(),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Cancel'),
-        ),
-        ElevatedButton(
-          onPressed: () => Navigator.pop(context, _params),
-          child: const Text('Save'),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildParameterEditor() {
-    switch (widget.operation.type) {
-      case OperationType.speed:
-        return _buildSpeedEditor();
-      case OperationType.brightness:
-        return _buildBrightnessEditor();
-      case OperationType.contrast:
-        return _buildContrastEditor();
-      case OperationType.saturation:
-        return _buildSaturationEditor();
-      case OperationType.fade:
-        return _buildFadeEditor();
-      case OperationType.zoom:
-        return _buildZoomEditor();
-      case OperationType.portrait:
-      case OperationType.removeAudio:
-        return const Text(
-          'This operation has no parameters to edit',
-          style: TextStyle(color: AppTheme.textSecondary),
-        );
-    }
-  }
-
-  Widget _buildSpeedEditor() {
-    double speed = _params['speed'] ?? 1.0;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          'Speed: ${speed.toStringAsFixed(2)}x',
-          style: const TextStyle(color: AppTheme.textPrimary),
-        ),
-        Slider(
-          value: speed,
-          min: 0.25,
-          max: 4.0,
-          divisions: 15,
-          label: '${speed.toStringAsFixed(2)}x',
-          onChanged: (value) {
-            setState(() {
-              _params['speed'] = value;
-            });
-          },
-        ),
-      ],
-    );
-  }
-
-  Widget _buildBrightnessEditor() {
-    double brightness = _params['brightness'] ?? 0.0;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          'Brightness: ${brightness.toStringAsFixed(2)}',
-          style: const TextStyle(color: AppTheme.textPrimary),
-        ),
-        Slider(
-          value: brightness,
-          min: -1.0,
-          max: 1.0,
-          divisions: 20,
-          label: brightness.toStringAsFixed(2),
-          onChanged: (value) {
-            setState(() {
-              _params['brightness'] = value;
-            });
-          },
-        ),
-      ],
-    );
-  }
-
-  Widget _buildContrastEditor() {
-    double contrast = _params['contrast'] ?? 1.0;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          'Contrast: ${contrast.toStringAsFixed(2)}',
-          style: const TextStyle(color: AppTheme.textPrimary),
-        ),
-        Slider(
-          value: contrast,
-          min: 0.0,
-          max: 3.0,
-          divisions: 30,
-          label: contrast.toStringAsFixed(2),
-          onChanged: (value) {
-            setState(() {
-              _params['contrast'] = value;
-            });
-          },
-        ),
-      ],
-    );
-  }
-
-  Widget _buildSaturationEditor() {
-    double saturation = _params['saturation'] ?? 1.0;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          'Saturation: ${saturation.toStringAsFixed(2)}',
-          style: const TextStyle(color: AppTheme.textPrimary),
-        ),
-        Slider(
-          value: saturation,
-          min: 0.0,
-          max: 3.0,
-          divisions: 30,
-          label: saturation.toStringAsFixed(2),
-          onChanged: (value) {
-            setState(() {
-              _params['saturation'] = value;
-            });
-          },
-        ),
-      ],
-    );
-  }
-
-  Widget _buildFadeEditor() {
-    double duration = _params['duration'] ?? 1.0;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          'Duration: ${duration.toStringAsFixed(1)}s',
-          style: const TextStyle(color: AppTheme.textPrimary),
-        ),
-        Slider(
-          value: duration,
-          min: 0.1,
-          max: 5.0,
-          divisions: 49,
-          label: '${duration.toStringAsFixed(1)}s',
-          onChanged: (value) {
-            setState(() {
-              _params['duration'] = value;
-            });
-          },
-        ),
-      ],
-    );
-  }
-
-  Widget _buildZoomEditor() {
-    double scale = _params['scale'] ?? 1.0;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          'Zoom Scale: ${scale.toStringAsFixed(2)}x',
-          style: const TextStyle(color: AppTheme.textPrimary),
-        ),
-        Slider(
-          value: scale,
-          min: 1.0,
-          max: 3.0,
-          divisions: 20,
-          label: '${scale.toStringAsFixed(2)}x',
-          onChanged: (value) {
-            setState(() {
-              _params['scale'] = value;
-            });
-          },
-        ),
-      ],
-    );
-  }
+  TimelineTrack({
+    required this.id,
+    this.videoPath,
+    this.videoName,
+    this.secondVideoPath,
+    this.secondVideoName,
+    this.outroPath,
+    this.outroName,
+    this.musicPath,
+    this.musicName,
+  });
 }
