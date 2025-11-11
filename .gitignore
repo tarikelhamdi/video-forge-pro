@@ -56,5 +56,9 @@ app.*.map.json
 *.m4a
 *.aac
 
+# Backup files
+*.backup
+*_old.dart
+
 # Debug logs
 debug.log
