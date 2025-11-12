@@ -5,6 +5,27 @@ All notable changes to Video Editor Pro will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2025-11-12
+
+### Added
+- **Extended Split Duration Range**: Split video clips from 0 seconds to 10 minutes (600 seconds)
+  - Previously limited to 5-30 seconds
+  - Now supports full range: 0s to 10m (600s)
+  - 120 divisions for precise control
+- **Smart Duration Formatting**: Display format changes based on duration
+  - Less than 1 minute: `30s`, `45s`
+  - Full minutes: `1m`, `5m`, `10m`
+  - Mixed format: `1m 30s`, `2m 45s`
+
+### Changed
+- Updated Min/Max duration sliders to support 0-600 seconds range
+- Improved `splitVideo` function to use custom min/max durations
+- Enhanced duration display for better readability
+
+### Fixed
+- Split feature now correctly uses user-defined min/max durations
+- Previously was locked to 10-15 seconds regardless of slider values
+
 ## [2.0.0] - 2025-11-11
 
 ### Added

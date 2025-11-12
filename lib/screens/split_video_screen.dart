@@ -25,7 +25,7 @@ class _SplitVideoScreenState extends ConsumerState<SplitVideoScreen> {
   String _statusMessage = '';
   List<String> _splitClips = [];
   
-  // Split settings
+  // Split settings (0 seconds to 10 minutes = 600 seconds)
   int _minClipDuration = 10;
   int _maxClipDuration = 15;
   bool _discardShortClips = true;
@@ -116,6 +116,8 @@ class _SplitVideoScreenState extends ConsumerState<SplitVideoScreen> {
         inputPath: _selectedVideo!,
         outputDir: outputDir.path,
         clipDurationSeconds: _maxClipDuration,
+        minClipDuration: _minClipDuration,
+        maxClipDuration: _maxClipDuration,
       );
 
       setState(() {
@@ -196,6 +198,19 @@ class _SplitVideoScreenState extends ConsumerState<SplitVideoScreen> {
       _progress = 0.0;
       _statusMessage = '';
     });
+  }
+
+  /// Format duration in seconds to readable format (MM:SS or XXs)
+  String _formatDuration(int seconds) {
+    if (seconds < 60) {
+      return '${seconds}s';
+    }
+    final minutes = seconds ~/ 60;
+    final remainingSeconds = seconds % 60;
+    if (remainingSeconds == 0) {
+      return '${minutes}m';
+    }
+    return '${minutes}m ${remainingSeconds}s';
   }
 
   @override
@@ -337,14 +352,14 @@ class _SplitVideoScreenState extends ConsumerState<SplitVideoScreen> {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(
-                              'Min Duration: $_minClipDuration seconds',
+                              'Min Duration: ${_formatDuration(_minClipDuration)}',
                               style: const TextStyle(color: AppTheme.textSecondary),
                             ),
                             Slider(
                               value: _minClipDuration.toDouble(),
-                              min: 5,
-                              max: 20,
-                              divisions: 15,
+                              min: 0,
+                              max: 600,
+                              divisions: 120,
                               activeColor: AppTheme.neonBlue,
                               onChanged: (value) {
                                 setState(() {
@@ -364,14 +379,14 @@ class _SplitVideoScreenState extends ConsumerState<SplitVideoScreen> {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(
-                              'Max Duration: $_maxClipDuration seconds',
+                              'Max Duration: ${_formatDuration(_maxClipDuration)}',
                               style: const TextStyle(color: AppTheme.textSecondary),
                             ),
                             Slider(
                               value: _maxClipDuration.toDouble(),
-                              min: 10,
-                              max: 30,
-                              divisions: 20,
+                              min: 0,
+                              max: 600,
+                              divisions: 120,
                               activeColor: AppTheme.neonPurple,
                               onChanged: (value) {
                                 setState(() {

@@ -94,6 +94,8 @@ class VideoProcessingService {
     required String inputPath,
     required String outputDir,
     required int clipDurationSeconds,
+    int? minClipDuration,
+    int? maxClipDuration,
   }) async {
     _ensureInitialized();
     
@@ -118,17 +120,25 @@ class VideoProcessingService {
     final outputFiles = <String>[];
     final random = Random();
     
+    // Use provided min/max or defaults
+    final minDuration = minClipDuration ?? 10;
+    final maxDuration = maxClipDuration ?? clipDurationSeconds;
+    
     double currentTime = 0;
     int clipIndex = 1;
     
     while (currentTime < totalDuration) {
-      // Random clip duration between 10 and 15 seconds
-      final randomDuration = 10 + random.nextInt(6); // 10-15 seconds
+      // Random clip duration between min and max
+      final durationRange = maxDuration - minDuration;
+      final randomDuration = durationRange > 0 
+          ? minDuration + random.nextInt(durationRange + 1)
+          : maxDuration;
+      
       final remainingTime = totalDuration - currentTime;
       
-      // Skip if remaining time is less than 10 seconds
-      if (remainingTime < 10) {
-        print('Skipping last segment (${remainingTime.toStringAsFixed(1)}s < 10s)');
+      // Skip if remaining time is less than minimum duration
+      if (remainingTime < minDuration && minDuration > 0) {
+        print('Skipping last segment (${remainingTime.toStringAsFixed(1)}s < ${minDuration}s)');
         break;
       }
       
